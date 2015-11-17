@@ -207,10 +207,10 @@ class WebAgent
   private
 
     def domain_warning
-      unless @@domain_warned
-        warn('Cookie#domain returns dot-less domain name now. Use Cookie#dot_domain if you need "." at the beginning.')
-        @@domain_warned = true
-      end
+      #unless @@domain_warned
+      #  warn('Cookie#domain returns dot-less domain name now. Use Cookie#dot_domain if you need "." at the beginning.')
+      #  @@domain_warned = true
+      #end
     end
 
     def deprecated(old, new)
