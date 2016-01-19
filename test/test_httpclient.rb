@@ -115,6 +115,14 @@ class TestHTTPClient < Test::Unit::TestCase
     assert_equal("Accept: text/html", lines[4])
   end
 
+  def test_header_symbol
+    str = ""
+    @client.debug_dev = str
+    @client.post(serverurl + 'servlet', :header => {:'Content-Type' => 'application/json'}, :body => 'hello')
+    lines = str.split(/(?:\r?\n)+/).grep(/^Content-Type/)
+    assert_equal(2, lines.size) # 1 for both request and response
+  end
+
   def test_host_given
     str = ""
     @client.debug_dev = str
@@ -138,7 +146,7 @@ class TestHTTPClient < Test::Unit::TestCase
 
   def test_redirect_returns_not_modified
     assert_nothing_raised do
-      timeout(2) do
+      ::Timeout.timeout(2) do
         @client.get(serverurl + 'status', {:status => 306}, {:follow_redirect => true})
       end
     end
@@ -531,7 +539,7 @@ EOS
 
   def test_no_content
     assert_nothing_raised do
-      timeout(2) do
+      ::Timeout.timeout(2) do
         @client.get(serverurl + 'status', :status => 101)
         @client.get(serverurl + 'status', :status => 204)
         @client.get(serverurl + 'status', :status => 304)

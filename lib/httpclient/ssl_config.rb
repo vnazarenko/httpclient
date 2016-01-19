@@ -35,6 +35,7 @@ class HTTPClient
   # You may want to change trust anchor by yourself.  Call clear_cert_store
   # then add_trust_ca for that purpose.
   class SSLConfig
+    include HTTPClient::Util
     include OpenSSL if SSLEnabled
 
     CIPHERS_DEFAULT = "ALL:!aNULL:!eNULL:!SSLv2" # OpenSSL >1.0.0 default
@@ -446,11 +447,14 @@ class HTTPClient
           (ver.start_with?('OpenSSL ') && ver >= 'OpenSSL 1.0.2d') || defined?(JRuby)
         filename = 'cacert.pem'
       else
-        warn("RSA 1024 bit CA certificates are loaded due to old openssl compatibility")
+        warning("RSA 1024 bit CA certificates are loaded due to old openssl compatibility")
         filename = 'cacert1024.pem'
       end
       file = File.join(File.dirname(__FILE__), filename)
-      add_trust_ca_to_store(cert_store, file)
+      unless defined?(JRuby)
+        # JRuby uses @cert_store_items
+        add_trust_ca_to_store(cert_store, file)
+      end
       @cert_store_items << file
     end
   end

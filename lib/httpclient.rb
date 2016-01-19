@@ -393,9 +393,24 @@ class HTTPClient
   #
   # After you set :base_url, all resources you pass to get, post and other
   # methods are recognized to be prefixed with base_url. Say base_url is
-  # 'https://api.example.com/v1, get('/users') is the same as
+  # 'https://api.example.com/v1/, get('users') is the same as
   # get('https://api.example.com/v1/users') internally. You can also pass
   # full URL from 'http://' even after setting base_url.
+  #
+  # The expected base_url and path behavior is the following. Please take
+  # care of '/' in base_url and path.
+  #
+  # The last '/' is important for base_url:
+  #   1. http://foo/bar/baz/ + path -> http://foo/bar/baz/path
+  #   2. http://foo/bar/baz + path -> http://foo/bar/path
+  # Relative path handling:
+  #   3. http://foo/bar/baz/ + ../path -> http://foo/bar/path
+  #   4. http://foo/bar/baz + ../path -> http://foo/path
+  #   5. http://foo/bar/baz/ + ./path -> http://foo/bar/baz/path
+  #   6. http://foo/bar/baz + ./path -> http://foo/bar/path
+  # The leading '/' of path means absolute path:
+  #   7. http://foo/bar/baz/ + /path -> http://foo/path
+  #   8. http://foo/bar/baz + /path -> http://foo/path
   #
   # :default_header is for providing default headers Hash that all HTTP
   # requests should have, such as custom 'Authorization' header in API.
@@ -703,9 +718,9 @@ class HTTPClient
   def default_redirect_uri_callback(uri, res)
     newuri = urify(res.header['location'][0])
     if !http?(newuri) && !https?(newuri)
-      newuri = uri + newuri
-      warn("could be a relative URI in location header which is not recommended")
+      warn("#{newuri}: a relative URI in location header which is not recommended")
       warn("'The field value consists of a single absolute URI' in HTTP spec")
+      newuri = uri + newuri
     end
     if https?(uri) && !https?(newuri)
       raise BadResponseError.new("redirecting to non-https resource")
@@ -1133,7 +1148,7 @@ private
     boundary = nil
     if body
       _, content_type = header.find { |key, value|
-        key.downcase == 'content-type'
+        key.to_s.downcase == 'content-type'
       }
       if content_type
         if /\Amultipart/ =~ content_type
@@ -1142,7 +1157,7 @@ private
           else
             boundary = create_boundary
             content_type = "#{content_type}; boundary=#{boundary}"
-            header = override_header(header, 'Content-Type', content_type)
+            header = override_header(header, 'content-type', content_type)
           end
         end
       else
@@ -1180,7 +1195,7 @@ private
   def override_header(header, key, value)
     result = []
     header.each do |k, v|
-      if k.downcase == key.downcase
+      if k.to_s.downcase == key
         result << [key, value]
       else
         result << [k, v]

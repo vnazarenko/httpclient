@@ -315,7 +315,7 @@ unless defined?(SSLSocket)
       def add(file_or_dir)
         return if file_or_dir == :default
         if File.directory?(file_or_dir)
-          warn('directory not yet supported')
+          warn("#{file_or_dir}: directory not yet supported")
         else
           pem = nil
           File.read(file_or_dir).each_line do |line|
@@ -447,7 +447,7 @@ unless defined?(SSLSocket)
       if config.ssl_version == :auto
         ssl_version = DEFAULT_SSL_PROTOCOL
       else
-        ssl_version = config.to_s.gsub(/_/, '.')
+        ssl_version = config.ssl_version.to_s.gsub(/_/, '.')
       end
       unless config.cert_store_crl_items.empty?
         raise NotImplementedError.new('Manual CRL configuration is not yet supported')
