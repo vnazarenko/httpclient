@@ -309,7 +309,6 @@ class HTTPClient
       if assignable
         aname = name + '='
         define_method(aname) { |rhs|
-          reset_all
           @session_manager.__send__(aname, rhs)
         }
       end
@@ -356,6 +355,8 @@ class HTTPClient
   # if your ruby is older than 2005-09-06, do not set socket_sync = false to
   # avoid an SSL socket blocking bug in openssl/buffering.rb.
   attr_proxy(:socket_sync, true)
+  # Enables TCP keepalive; no timing settings exist at present
+  attr_proxy(:tcp_keepalive, true)
   # User-Agent header in HTTP request.
   attr_proxy(:agent_name, true)
   # From header in HTTP request.
@@ -365,6 +366,9 @@ class HTTPClient
   attr_proxy(:test_loopback_http_response)
   # Decompress a compressed (with gzip or deflate) content body transparently. false by default.
   attr_proxy(:transparent_gzip_decompression, true)
+  # Raise BadResponseError if response size does not match with Content-Length header in response. false by default.
+  # TODO: enable by default
+  attr_proxy(:strict_response_size_check, true)
   # Local socket address. Set HTTPClient#socket_local.host and HTTPClient#socket_local.port to specify local binding hostname and port of TCP socket.
   attr_proxy(:socket_local, true)
 
@@ -844,13 +848,7 @@ class HTTPClient
     end
     uri = to_resource_url(uri)
     if block
-      if block.arity == 1
-        filtered_block = proc { |res, str|
-          block.call(str)
-        }
-      else
-        filtered_block = block
-      end
+      filtered_block = adapt_block(&block)
     end
     if follow_redirect
       follow_redirect(method, uri, query, body, header, &block)
@@ -1082,11 +1080,17 @@ private
     ENV[name.downcase] || ENV[name.upcase]
   end
 
+  def adapt_block(&block)
+    return block if block.arity == 2
+    proc { |r, str| block.call(str) }
+  end
+
   def follow_redirect(method, uri, query, body, header, &block)
     uri = to_resource_url(uri)
     if block
+      b = adapt_block(&block)
       filtered_block = proc { |r, str|
-        block.call(str) if r.ok?
+        b.call(r, str) if r.ok?
       }
     end
     if HTTP::Message.file?(body)
@@ -1270,6 +1274,7 @@ private
       return
     end
     piper, pipew = IO.pipe
+    pipew.binmode
     res = HTTP::Message.new_response(piper, req.header)
     @debug_dev << "= Request\n\n" if @debug_dev
     sess = @session_manager.query(req, proxy)

@@ -36,60 +36,109 @@ class HTTPClient
   # then add_trust_ca for that purpose.
   class SSLConfig
     include HTTPClient::Util
-    include OpenSSL if SSLEnabled
+    if SSLEnabled
+      include OpenSSL
+
+      module ::OpenSSL
+        module X509
+          class Store
+            attr_reader :_httpclient_cert_store_items
+
+            # TODO: use prepend instead when we drop JRuby + 1.9.x support
+            wrapped = {}
+
+            wrapped[:initialize] = instance_method(:initialize)
+            define_method(:initialize) do |*args|
+              wrapped[:initialize].bind(self).call(*args)
+              @_httpclient_cert_store_items = [ENV['SSL_CERT_FILE'] || :default]
+            end
+
+            [:add_cert, :add_file, :add_path].each do |m|
+              wrapped[m] = instance_method(m)
+              define_method(m) do |cert|
+                res = wrapped[m].bind(self).call(cert)
+                @_httpclient_cert_store_items << cert
+                res
+              end
+            end
+          end
+        end
+      end
+    end
+
+    class << self
+    private
+      def attr_config(symbol)
+        name = symbol.to_s
+        ivar_name = "@#{name}"
+        define_method(name) {
+          instance_variable_get(ivar_name)
+        }
+        define_method("#{name}=") { |rhs|
+          if instance_variable_get(ivar_name) != rhs
+            instance_variable_set(ivar_name, rhs)
+            change_notify
+          end
+        }
+        symbol
+      end
+    end
+
 
     CIPHERS_DEFAULT = "ALL:!aNULL:!eNULL:!SSLv2" # OpenSSL >1.0.0 default
 
     # Which TLS protocol version (also called method) will be used. Defaults
-    # to :auto which means that OpenSSL decides (In my tests this resulted 
+    # to :auto which means that OpenSSL decides (In my tests this resulted
     # with always the highest available protocol being used).
     # String name of OpenSSL's SSL version method name: TLSv1_2, TLSv1_1, TLSv1,
     # SSLv2, SSLv23, SSLv3 or :auto (and nil) to allow version negotiation (default).
     # See {OpenSSL::SSL::SSLContext::METHODS} for a list of available versions
     # in your specific Ruby environment.
-    attr_reader :ssl_version
+    attr_config :ssl_version
     # OpenSSL::X509::Certificate:: certificate for SSL client authentication.
     # nil by default. (no client authentication)
-    attr_reader :client_cert
+    attr_config :client_cert
     # OpenSSL::PKey::PKey:: private key for SSL client authentication.
     # nil by default. (no client authentication)
-    attr_reader :client_key
-    attr_reader :client_key_pass
+    attr_config :client_key
+    # OpenSSL::PKey::PKey:: private key pass phrase for client_key.
+    # nil by default. (no pass phrase)
+    attr_config :client_key_pass
 
     # A number which represents OpenSSL's verify mode.  Default value is
     # OpenSSL::SSL::VERIFY_PEER | OpenSSL::SSL::VERIFY_FAIL_IF_NO_PEER_CERT.
-    attr_reader :verify_mode
+    attr_config :verify_mode
     # A number of verify depth.  Certification path which length is longer than
     # this depth is not allowed.
     # CAUTION: this is OpenSSL specific option and ignored on JRuby.
-    attr_reader :verify_depth
+    attr_config :verify_depth
     # A callback handler for custom certificate verification.  nil by default.
     # If the handler is set, handler.call is invoked just after general
     # OpenSSL's verification.  handler.call is invoked with 2 arguments,
     # ok and ctx; ok is a result of general OpenSSL's verification.  ctx is a
     # OpenSSL::X509::StoreContext.
-    attr_reader :verify_callback
+    attr_config :verify_callback
     # SSL timeout in sec.  nil by default.
-    attr_reader :timeout
+    attr_config :timeout
     # A number of OpenSSL's SSL options.  Default value is
     # OpenSSL::SSL::OP_ALL | OpenSSL::SSL::OP_NO_SSLv2
     # CAUTION: this is OpenSSL specific option and ignored on JRuby.
     # Use ssl_version to specify the TLS version you want to use.
-    attr_reader :options
+    attr_config :options
     # A String of OpenSSL's cipher configuration.  Default value is
     # ALL:!ADH:!LOW:!EXP:!MD5:+SSLv2:@STRENGTH
     # See ciphers(1) man in OpenSSL for more detail.
-    attr_reader :ciphers
+    attr_config :ciphers
 
     # OpenSSL::X509::X509::Store used for verification.  You can reset the
     # store with clear_cert_store and set the new store with cert_store=.
     attr_reader :cert_store # don't use if you don't know what it is.
 
     # For server side configuration.  Ignore this.
-    attr_reader :client_ca # :nodoc:
+    attr_config :client_ca # :nodoc:
 
     # These array keeps original files/dirs that was added to @cert_store
-    attr_reader :cert_store_items
+    def cert_store_items; @cert_store._httpclient_cert_store_items; end
     attr_reader :cert_store_crl_items
 
     # Creates a SSLConfig.
@@ -97,9 +146,8 @@ class HTTPClient
       return unless SSLEnabled
       @client = client
       @cert_store = X509::Store.new
-      @cert_store_items = [:default]
       @cert_store_crl_items = []
-      @client_cert = @client_key = @client_ca = nil
+      @client_cert = @client_key = @client_key_pass = @client_ca = nil
       @verify_mode = SSL::VERIFY_PEER | SSL::VERIFY_FAIL_IF_NO_PEER_CERT
       @verify_depth = nil
       @verify_callback = nil
@@ -117,42 +165,18 @@ class HTTPClient
       @cacerts_loaded = false
     end
 
-    # Sets SSL version method String.  Possible values: "SSLv2" for SSL2,
-    # "SSLv3" for SSL3 and TLS1.x, "SSLv23" for SSL3 with fallback to SSL2.
-    def ssl_version=(ssl_version)
-      @ssl_version = ssl_version
-      change_notify
-    end
-
-    # Sets certificate (OpenSSL::X509::Certificate) for SSL client
-    # authentication.
-    # client_key and client_cert must be a pair.
-    #
-    # Calling this method resets all existing sessions.
-    def client_cert=(client_cert)
-      @client_cert = client_cert
-      change_notify
-    end
-
-    # Sets private key (OpenSSL::PKey::PKey) for SSL client authentication.
-    # client_key and client_cert must be a pair.
-    #
-    # Calling this method resets all existing sessions.
-    def client_key=(client_key)
-      @client_key = client_key
-      change_notify
-    end
-
     # Sets certificate and private key for SSL client authentication.
     # cert_file:: must be a filename of PEM/DER formatted file.
     # key_file:: must be a filename of PEM/DER formatted file.  Key must be an
     #            RSA key.  If you want to use other PKey algorithm,
     #            use client_key=.
     #
-    # Calling this method resets all existing sessions.
+    # Calling this method resets all existing sessions if value is changed.
     def set_client_cert_file(cert_file, key_file, pass = nil)
-      @client_cert, @client_key, @client_key_pass = cert_file, key_file, pass
-      change_notify
+      if (@client_cert != cert_file) || (@client_key != key_file) || (@client_key_pass != pass)
+        @client_cert, @client_key, @client_key_pass = cert_file, key_file, pass
+        change_notify
+      end
     end
 
     # Sets OpenSSL's default trusted CA certificates.  Generally, OpenSSL is
@@ -170,7 +194,6 @@ class HTTPClient
       @cacerts_loaded = true # avoid lazy override
       @cert_store = X509::Store.new
       @cert_store.set_default_paths
-      @cert_store_items = [ENV['SSL_CERT_FILE'] || :default]
       change_notify
     end
 
@@ -181,7 +204,7 @@ class HTTPClient
     def clear_cert_store
       @cacerts_loaded = true # avoid lazy override
       @cert_store = X509::Store.new
-      @cert_store_items.clear
+      @cert_store._httpclient_cert_store_items.clear
       change_notify
     end
 
@@ -190,10 +213,12 @@ class HTTPClient
     #
     # Calling this method resets all existing sessions.
     def cert_store=(cert_store)
-      @cacerts_loaded = true # avoid lazy override
-      @cert_store = cert_store
-      @cert_store_items.clear
-      change_notify
+      # This is object equality check, since OpenSSL::X509::Store doesn't overload ==
+      if !@cacerts_loaded || (@cert_store != cert_store)
+        @cacerts_loaded = true # avoid lazy override
+        @cert_store = cert_store
+        change_notify
+      end
     end
 
     # Sets trust anchor certificate(s) for verification.
@@ -204,9 +229,11 @@ class HTTPClient
     #
     # Calling this method resets all existing sessions.
     def add_trust_ca(trust_ca_file_or_hashed_dir)
+      unless File.exist?(trust_ca_file_or_hashed_dir)
+        trust_ca_file_or_hashed_dir = File.join(File.dirname(__FILE__), trust_ca_file_or_hashed_dir)
+      end
       @cacerts_loaded = true # avoid lazy override
       add_trust_ca_to_store(@cert_store, trust_ca_file_or_hashed_dir)
-      @cert_store_items << trust_ca_file_or_hashed_dir
       change_notify
     end
     alias set_trust_ca add_trust_ca
@@ -249,60 +276,8 @@ class HTTPClient
     end
     alias set_crl add_crl
 
-    # Sets verify mode of OpenSSL.  New value must be a combination of
-    # constants OpenSSL::SSL::VERIFY_*
-    #
-    # Calling this method resets all existing sessions.
-    def verify_mode=(verify_mode)
-      @verify_mode = verify_mode
-      change_notify
-    end
-
-    # Sets verify depth.  New value must be a number.
-    #
-    # Calling this method resets all existing sessions.
-    def verify_depth=(verify_depth)
-      @verify_depth = verify_depth
-      change_notify
-    end
-
-    # Sets callback handler for custom certificate verification.
-    # See verify_callback.
-    #
-    # Calling this method resets all existing sessions.
-    def verify_callback=(verify_callback)
-      @verify_callback = verify_callback
-      change_notify
-    end
-
-    # Sets SSL timeout in sec.
-    #
-    # Calling this method resets all existing sessions.
-    def timeout=(timeout)
-      @timeout = timeout
-      change_notify
-    end
-
-    # Sets SSL options.  New value must be a combination of # constants
-    # OpenSSL::SSL::OP_*
-    #
-    # Calling this method resets all existing sessions.
-    def options=(options)
-      @options = options
-      change_notify
-    end
-
-    # Sets cipher configuration.  New value must be a String.
-    #
-    # Calling this method resets all existing sessions.
-    def ciphers=(ciphers)
-      @ciphers = ciphers
-      change_notify
-    end
-
-    def client_ca=(client_ca) # :nodoc:
-      @client_ca = client_ca
-      change_notify
+    def verify?
+      @verify_mode && (@verify_mode & OpenSSL::SSL::VERIFY_PEER != 0)
     end
 
     # interfaces for SSLSocket.
@@ -438,24 +413,10 @@ class HTTPClient
       nil
     end
 
-    # Use 2014 bit certs trust anchor if possible.
-    # CVE-2015-1793 requires: OpenSSL >= 1.0.2d or OpenSSL >= 1.0.1p
-    # OpenSSL before 1.0.1 does not have CVE-2015-1793 problem
+    # Use 2048 bit certs trust anchor
     def load_cacerts(cert_store)
-      ver = OpenSSL::OPENSSL_VERSION
-      if (ver.start_with?('OpenSSL 1.0.1') && ver >= 'OpenSSL 1.0.1p') ||
-          (ver.start_with?('OpenSSL ') && ver >= 'OpenSSL 1.0.2d') || defined?(JRuby)
-        filename = 'cacert.pem'
-      else
-        warning("RSA 1024 bit CA certificates are loaded due to old openssl compatibility")
-        filename = 'cacert1024.pem'
-      end
-      file = File.join(File.dirname(__FILE__), filename)
-      unless defined?(JRuby)
-        # JRuby uses @cert_store_items
-        add_trust_ca_to_store(cert_store, file)
-      end
-      @cert_store_items << file
+      file = File.join(File.dirname(__FILE__), 'cacert.pem')
+      add_trust_ca_to_store(cert_store, file)
     end
   end
 

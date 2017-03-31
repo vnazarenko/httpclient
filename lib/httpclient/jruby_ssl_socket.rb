@@ -15,8 +15,22 @@ class HTTPClient
 unless defined?(SSLSocket)
 
   class JavaSocketWrap
+    java_import 'java.net.InetSocketAddress'
     java_import 'java.io.BufferedInputStream'
+
     BUF_SIZE = 1024 * 16
+
+    def self.connect(socket, site, opts = {})
+      socket_addr = InetSocketAddress.new(site.host, site.port)
+      if opts[:connect_timeout]
+        socket.connect(socket_addr, opts[:connect_timeout])
+      else
+        socket.connect(socket_addr)
+      end
+      socket.setSoTimeout(opts[:so_timeout]) if opts[:so_timeout]
+      socket.setKeepAlive(true) if opts[:tcp_keepalive]
+      socket
+    end
 
     def initialize(socket, debug_dev = nil)
       @socket = socket
@@ -38,7 +52,6 @@ unless defined?(SSLSocket)
     def eof?
       @socket.isClosed
     end
-
 
     def gets(rs)
       while (size = @bufstr.index(rs)).nil?
@@ -105,11 +118,15 @@ unless defined?(SSLSocket)
   private
 
     def fill
-      size = @instr.read(@buf)
-      if size > 0
-        @bufstr << String.from_java_bytes(@buf, Encoding::BINARY)[0, size]
+      begin
+        size = @instr.read(@buf)
+        if size > 0
+          @bufstr << String.from_java_bytes(@buf, Encoding::BINARY)[0, size]
+        end
+        size
+      rescue java.io.IOException => e
+        raise OpenSSL::SSL::SSLError.new("#{e.class}: #{e.getMessage}")
       end
-      size
     end
 
     def debug(str)
@@ -267,8 +284,8 @@ unless defined?(SSLSocket)
 
     module PEMUtils
       def self.read_certificate(pem)
-        pem = pem.sub(/-----BEGIN CERTIFICATE-----/, '').sub(/-----END CERTIFICATE-----/, '')
-        der = pem.unpack('m*').first
+        cert = pem.sub(/.*?-----BEGIN CERTIFICATE-----/m, '').sub(/-----END CERTIFICATE-----.*?/m, '')
+        der = cert.unpack('m*').first
         cf = CertificateFactory.getInstance('X.509')
         cf.generateCertificate(ByteArrayInputStream.new(der.to_java_bytes))
       end
@@ -289,11 +306,11 @@ unless defined?(SSLSocket)
         @keystore.load(nil)
       end
 
-      def add(cert_file, key_file, password)
-        cert_str = cert_file.respond_to?(:to_pem) ? cert_file.to_pem : File.read(cert_file.to_s)
+      def add(cert_source, key_source, password)
+        cert_str = cert_source.respond_to?(:to_pem) ? cert_source.to_pem : File.read(cert_source.to_s)
         cert = PEMUtils.read_certificate(cert_str)
         @keystore.setCertificateEntry('client_cert', cert)
-        key_str = key_file.respond_to?(:to_pem) ? key_file.to_pem : File.read(key_file.to_s)
+        key_str = key_source.respond_to?(:to_pem) ? key_source.to_pem : File.read(key_source.to_s)
         key_pair = PEMUtils.read_private_key(key_str, password)
         @keystore.setKeyEntry('client_key', key_pair.getPrivate, PASSWORD, [cert].to_java(Certificate))
       end
@@ -312,20 +329,23 @@ unless defined?(SSLSocket)
         @size = 0
       end
 
-      def add(file_or_dir)
-        return if file_or_dir == :default
-        if File.directory?(file_or_dir)
-          warn("#{file_or_dir}: directory not yet supported")
+      def add(cert_source)
+        return if cert_source == :default
+        if cert_source.respond_to?(:to_pem)
+          pem = cert_source.to_pem
+          load_pem(pem)
+        elsif File.directory?(cert_source)
+          warn("#{cert_source}: directory not yet supported")
+          return
         else
           pem = nil
-          File.read(file_or_dir).each_line do |line|
+          File.read(cert_source).each_line do |line|
             case line
             when /-----BEGIN CERTIFICATE-----/
               pem = ''
             when /-----END CERTIFICATE-----/
-              cert = PEMUtils.read_certificate(pem)
-              @size += 1
-              @trust_store.setCertificateEntry("cert_#{@size}", cert)
+              load_pem(pem)
+              # keep parsing in case where multiple certificates in a file
             else
               if pem
                 pem << line
@@ -341,6 +361,14 @@ unless defined?(SSLSocket)
         else
           @trust_store
         end
+      end
+
+    private
+
+      def load_pem(pem)
+        cert = PEMUtils.read_certificate(pem)
+        @size += 1
+        @trust_store.setCertificateEntry("cert_#{@size}", cert)
       end
     end
 
@@ -429,26 +457,56 @@ unless defined?(SSLSocket)
     end
 
     def self.create_socket(session)
-      site = session.proxy || session.dest
-      socket = Socket.new(site.host, site.port)
+      opts = {
+        :connect_timeout => session.connect_timeout * 1000,
+        # send_timeout is ignored in JRuby
+        :so_timeout => session.receive_timeout * 1000,
+        :tcp_keepalive => session.tcp_keepalive,
+        :debug_dev => session.debug_dev
+      }
+      socket = nil
       begin
         if session.proxy
+          site = session.proxy || session.dest
+          socket = JavaSocketWrap.connect(Socket.new, site, opts)
           session.connect_ssl_proxy(JavaSocketWrap.new(socket), Util.urify(session.dest.to_s))
         end
+        new(socket, session.dest, session.ssl_config, opts)
       rescue
-        socket.close
+        socket.close if socket
         raise
       end
-      new(socket, session.dest, session.ssl_config, session.debug_dev)
     end
 
-    DEFAULT_SSL_PROTOCOL = 'TLS'
-    def initialize(socket, dest, config, debug_dev = nil)
-      if config.ssl_version == :auto
-        ssl_version = DEFAULT_SSL_PROTOCOL
-      else
-        ssl_version = config.ssl_version.to_s.gsub(/_/, '.')
+    DEFAULT_SSL_PROTOCOL = (java.lang.System.getProperty('java.specification.version') == '1.7') ? 'TLSv1.2' : 'TLS'
+    def initialize(socket, dest, config, opts = {})
+      @config = config
+      begin
+        @ssl_socket = create_ssl_socket(socket, dest, config, opts)
+        ssl_version = java_ssl_version(config)
+        @ssl_socket.setEnabledProtocols([ssl_version].to_java(java.lang.String)) if ssl_version != DEFAULT_SSL_PROTOCOL
+        if config.ciphers != SSLConfig::CIPHERS_DEFAULT
+          @ssl_socket.setEnabledCipherSuites(config.ciphers.to_java(java.lang.String))
+        end
+        ssl_connect(dest.host)
+      rescue java.security.GeneralSecurityException => e
+        raise OpenSSL::SSL::SSLError.new(e.getMessage)
+      rescue java.io.IOException => e
+        raise OpenSSL::SSL::SSLError.new("#{e.class}: #{e.getMessage}")
       end
+
+      super(@ssl_socket, opts[:debug_dev])
+    end
+
+    def java_ssl_version(config)
+      if config.ssl_version == :auto
+        DEFAULT_SSL_PROTOCOL
+      else
+        config.ssl_version.to_s.tr('_', '.')
+      end
+    end
+
+    def create_ssl_context(config)
       unless config.cert_store_crl_items.empty?
         raise NotImplementedError.new('Manual CRL configuration is not yet supported')
       end
@@ -464,7 +522,7 @@ unless defined?(SSLSocket)
 
       trust_store = nil
       verify_callback = config.verify_callback || config.method(:default_verify_callback)
-      if config.verify_mode == nil
+      if !config.verify?
         tmf = VerifyNoneTrustManagerFactory.new(verify_callback)
       else
         tmf = SystemTrustManagerFactory.new(verify_callback)
@@ -477,36 +535,24 @@ unless defined?(SSLSocket)
       tmf.init(trust_store)
       tm = tmf.getTrustManagers
 
-      ctx = SSLContext.getInstance(ssl_version)
+      ctx = SSLContext.getInstance(java_ssl_version(config))
       ctx.init(km, tm, nil)
       if config.timeout
         ctx.getClientSessionContext.setSessionTimeout(config.timeout)
       end
+      ctx
+    end
 
+    def create_ssl_socket(socket, dest, config, opts)
+      ctx = create_ssl_context(config)
       factory = ctx.getSocketFactory
-      begin
+      if socket
         ssl_socket = factory.createSocket(socket, dest.host, dest.port, true)
-        ssl_socket.setEnabledProtocols([ssl_version].to_java(java.lang.String)) if ssl_version != DEFAULT_SSL_PROTOCOL
-        if config.ciphers != SSLConfig::CIPHERS_DEFAULT
-          ssl_socket.setEnabledCipherSuites(config.ciphers.to_java(java.lang.String))
-        end
-        ssl_socket.startHandshake
-        ssl_session = ssl_socket.getSession
-        @peer_cert = JavaCertificate.new(ssl_session.getPeerCertificates.first)
-        if $DEBUG
-          warn("Protocol version: #{ssl_session.getProtocol}")
-          warn("Cipher: #{ssl_socket.getSession.getCipherSuite}")
-        end
-        post_connection_check(dest.host, @peer_cert)
-      rescue java.security.GeneralSecurityException => e
-        raise OpenSSL::SSL::SSLError.new(e.getMessage)
-      rescue javax.net.ssl.SSLException => e
-        raise OpenSSL::SSL::SSLError.new(e.getMessage)
-      rescue java.net.SocketException => e
-        raise OpenSSL::SSL::SSLError.new(e.getMessage)
+      else
+        ssl_socket = factory.createSocket
+        JavaSocketWrap.connect(ssl_socket, dest, opts)
       end
-
-      super(ssl_socket, debug_dev)
+      ssl_socket
     end
 
     def peer_cert
@@ -515,8 +561,23 @@ unless defined?(SSLSocket)
 
   private
 
-    def post_connection_check(hostname, wrap_cert)
-      BrowserCompatHostnameVerifier.new.verify(hostname, wrap_cert.cert)
+    def ssl_connect(hostname)
+      @ssl_socket.startHandshake
+      ssl_session = @ssl_socket.getSession
+      @peer_cert = JavaCertificate.new(ssl_session.getPeerCertificates.first)
+      if $DEBUG
+        warn("Protocol version: #{ssl_session.getProtocol}")
+        warn("Cipher: #{@ssl_socket.getSession.getCipherSuite}")
+      end
+      post_connection_check(hostname)
+    end
+
+    def post_connection_check(hostname)
+      if !@config.verify?
+        return
+      else
+        BrowserCompatHostnameVerifier.new.verify(hostname, @peer_cert.cert)
+      end
     end
   end
 

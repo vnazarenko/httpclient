@@ -609,10 +609,12 @@ EOS
     assert_not_equal('hello', content)
     assert_equal(GZIP_CONTENT, content)
     @client.transparent_gzip_decompression = true
+    @client.reset_all
     assert_equal('hello', @client.get_content(serverurl + 'compressed?enc=gzip'))
     assert_equal('hello', @client.get_content(serverurl + 'compressed?enc=deflate'))
     assert_equal('hello', @client.get_content(serverurl + 'compressed?enc=deflate_noheader'))
     @client.transparent_gzip_decompression = false
+    @client.reset_all
   end
 
   def test_get_content_with_block
@@ -765,6 +767,22 @@ EOS
     assert_equal(1000*1000, res.content.read.length)
   end
 
+  if RUBY_VERSION > "1.9"
+    def test_post_async_with_default_internal
+      original_encoding = Encoding.default_internal
+      Encoding.default_internal = Encoding::UTF_8
+      begin
+        post_body = StringIO.new("こんにちは")
+        conn = @client.post_async(serverurl + 'servlet', post_body)
+        Thread.pass while !conn.finished?
+        res = conn.pop
+        assert_equal 'post,こんにちは', res.content.read
+      ensure
+        Encoding.default_internal = original_encoding
+      end
+    end
+  end
+
   def test_get_with_block
     called = false
     res = @client.get(serverurl + 'servlet') { |str|
@@ -779,6 +797,29 @@ EOS
   def test_get_with_block_arity_2
     called = false
     res = @client.get(serverurl + 'servlet') { |blk_res, str|
+      assert_equal(200, blk_res.status)
+      assert_equal('get', str)
+      called = true
+    }
+    assert(called)
+    # res does not have a content
+    assert_nil(res.content)
+  end
+
+  def test_get_with_block_and_redirects
+    called = false
+    res = @client.get(serverurl + 'servlet', :follow_redirect => true) { |str|
+      assert_equal('get', str)
+      called = true
+    }
+    assert(called)
+    # res does not have a content
+    assert_nil(res.content)
+  end
+
+  def test_get_with_block_arity_2_and_redirects
+    called = false
+    res = @client.get(serverurl + 'servlet', :follow_redirect => true) { |blk_res, str|
       assert_equal(200, blk_res.status)
       assert_equal('get', str)
       called = true
@@ -1032,6 +1073,10 @@ EOS
   def test_post_with_custom_multipart_and_file
     STDOUT.sync = true
     File.open(__FILE__) do |file|
+      def file.original_filename
+        'file.txt'
+      end
+
       ext = { 'Content-Type' => 'multipart/alternative' }
       body = [{ 'Content-Type' => 'text/plain', :content => "this is only a test" },
               { 'Content-Type' => 'application/x-ruby', :content => file }]
@@ -1039,6 +1084,7 @@ EOS
       assert_match(/^Content-Type: text\/plain\r\n/m, res.content)
       assert_match(/^this is only a test\r\n/m, res.content)
       assert_match(/^Content-Type: application\/x-ruby\r\n/m, res.content)
+      assert_match(/Content-Disposition: form-data; name="3"; filename="file.txt"/, res.content)
       assert_match(/FIND_TAG_IN_THIS_FILE/, res.content)
     end
   end
@@ -1311,11 +1357,13 @@ EOS
     # this test takes 2 sec
     assert_equal('hello?sec=2', @client.get_content(serverurl + 'sleep?sec=2'))
     @client.receive_timeout = 1
+    @client.reset_all
     assert_equal('hello?sec=0', @client.get_content(serverurl + 'sleep?sec=0'))
     assert_raise(HTTPClient::ReceiveTimeoutError) do
       @client.get_content(serverurl + 'sleep?sec=2')
     end
     @client.receive_timeout = 3
+    @client.reset_all
     assert_equal('hello?sec=2', @client.get_content(serverurl + 'sleep?sec=2'))
   end
 
@@ -1323,11 +1371,13 @@ EOS
     # this test takes 2 sec
     assert_equal('hello', @client.post(serverurl + 'sleep', :sec => 2).content)
     @client.receive_timeout = 1
+    @client.reset_all
     assert_equal('hello', @client.post(serverurl + 'sleep', :sec => 0).content)
     assert_raise(HTTPClient::ReceiveTimeoutError) do
       @client.post(serverurl + 'sleep', :sec => 2)
     end
     @client.receive_timeout = 3
+    @client.reset_all
     assert_equal('hello', @client.post(serverurl + 'sleep', :sec => 2).content)
   end
 
@@ -1486,6 +1536,7 @@ EOS
     assert_equal('text/plain', HTTP::Message.mime_type('foo.txt'))
     assert_equal('text/html', HTTP::Message.mime_type('foo.html'))
     assert_equal('text/html', HTTP::Message.mime_type('foo.htm'))
+    assert_equal('text/xml', HTTP::Message.mime_type('foo.xml'))
     assert_equal('application/msword', HTTP::Message.mime_type('foo.doc'))
     assert_equal('image/png', HTTP::Message.mime_type('foo.png'))
     assert_equal('image/gif', HTTP::Message.mime_type('foo.gif'))
@@ -1779,6 +1830,19 @@ EOS
     end
   end
 
+  def test_strict_response_size_check
+    @client.strict_response_size_check = false
+    @client.test_loopback_http_response << "HTTP/1.0 200 OK\r\nContent-Length: 12345\r\n\r\nhello world"
+    assert_equal('hello world', @client.get_content('http://dummy'))
+
+    @client.reset_all
+    @client.strict_response_size_check = true
+    @client.test_loopback_http_response << "HTTP/1.0 200 OK\r\nContent-Length: 12345\r\n\r\nhello world"
+    assert_raise(HTTPClient::BadResponseError) do
+      @client.get_content('http://dummy')
+    end
+  end
+
   def test_socket_local
     @client.socket_local.host = '127.0.0.1'
     assert_equal('hello', @client.get_content(serverurl + 'hello'))
@@ -1842,6 +1906,18 @@ EOS
     assert_raise(ArgumentError) do
       @client.get_content("www.example.com")
     end
+  end
+
+  def test_tcp_keepalive
+    @client.tcp_keepalive = true
+    @client.get(serverurl)
+
+    # expecting HTTP keepalive caches the socket
+    session = @client.instance_variable_get(:@session_manager).send(:get_cached_session, HTTPClient::Site.new(URI.parse(serverurl)))
+    socket = session.instance_variable_get(:@socket)
+
+    assert_true(session.tcp_keepalive)
+    assert_equal(Socket::SO_KEEPALIVE, socket.getsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE).optname)
   end
 
 private

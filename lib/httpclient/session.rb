@@ -21,7 +21,7 @@ require 'zlib'
 require 'httpclient/timeout' # TODO: remove this once we drop 1.8 support
 require 'httpclient/ssl_config'
 require 'httpclient/http'
-if defined?(JRuby)
+if RUBY_ENGINE == 'jruby'
   require 'httpclient/jruby_ssl_socket'
 else
   require 'httpclient/ssl_socket'
@@ -76,7 +76,7 @@ class HTTPClient
     def to_s # :nodoc:
       addr
     end
-    
+
     # Returns true if scheme, host and port of the given URI matches with this.
     def match(uri)
       (@scheme == uri.scheme) and (@host == uri.host) and (@port == uri.port.to_i)
@@ -105,6 +105,8 @@ class HTTPClient
     attr_accessor :debug_dev
     # Boolean value for Socket#sync
     attr_accessor :socket_sync
+    # Boolean value to send TCP keepalive packets; no timing settings exist at present
+    attr_accessor :tcp_keepalive
 
     attr_accessor :connect_timeout
     # Maximum retry count.  0 for infinite.
@@ -114,6 +116,9 @@ class HTTPClient
     attr_accessor :keep_alive_timeout
     attr_accessor :read_block_size
     attr_accessor :protocol_retry_count
+
+    # Raise BadResponseError if response size does not match with Content-Length header in response.
+    attr_accessor :strict_response_size_check
 
     # Local address to bind local side of the socket to
     attr_accessor :socket_local
@@ -134,6 +139,7 @@ class HTTPClient
       @protocol_version = nil
       @debug_dev = client.debug_dev
       @socket_sync = true
+      @tcp_keepalive = false
       @chunk_size = ::HTTP::Message::Body::DEFAULT_CHUNK_SIZE
 
       @connect_timeout = 60
@@ -148,6 +154,7 @@ class HTTPClient
       @test_loopback_http_response = []
 
       @transparent_gzip_decompression = false
+      @strict_response_size_check = false
       @socket_local = Site.new
 
       @sess_pool = {}
@@ -212,6 +219,7 @@ class HTTPClient
       sess = Session.new(@client, site, @agent_name, @from)
       sess.proxy = via_proxy ? @proxy : nil
       sess.socket_sync = @socket_sync
+      sess.tcp_keepalive = @tcp_keepalive
       sess.requested_version = @protocol_version if @protocol_version
       sess.connect_timeout = @connect_timeout
       sess.connect_retry = @connect_retry
@@ -221,6 +229,7 @@ class HTTPClient
       sess.protocol_retry_count = @protocol_retry_count
       sess.ssl_config = @ssl_config
       sess.debug_dev = @debug_dev
+      sess.strict_response_size_check = @strict_response_size_check
       sess.socket_local = @socket_local
       sess.test_loopback_http_response = @test_loopback_http_response
       sess.transparent_gzip_decompression = @transparent_gzip_decompression
@@ -432,6 +441,8 @@ class HTTPClient
     attr_accessor :proxy
     # Boolean value for Socket#sync
     attr_accessor :socket_sync
+    # Boolean value to send TCP keepalive packets; no timing settings exist at present
+    attr_accessor :tcp_keepalive
     # Requested protocol version
     attr_accessor :requested_version
     # Device for dumping log for debugging
@@ -444,6 +455,7 @@ class HTTPClient
     attr_accessor :read_block_size
     attr_accessor :protocol_retry_count
 
+    attr_accessor :strict_response_size_check
     attr_accessor :socket_local
 
     attr_accessor :ssl_config
@@ -458,6 +470,7 @@ class HTTPClient
       @dest = dest
       @proxy = nil
       @socket_sync = true
+      @tcp_keepalive = false
       @requested_version = nil
 
       @debug_dev = nil
@@ -473,6 +486,7 @@ class HTTPClient
       @ssl_peer_cert = nil
 
       @test_loopback_http_response = nil
+      @strict_response_size_check = false
       @socket_local = Site::EMPTY
 
       @agent_name = agent_name
@@ -599,17 +613,16 @@ class HTTPClient
           clean_local = @socket_local.host.delete("[]")
           socket = TCPSocket.new(clean_host, port, clean_local, @socket_local.port)
         end
+        socket.setsockopt(Socket::SOL_SOCKET, Socket::SO_KEEPALIVE, true) if @tcp_keepalive
         if @debug_dev
           @debug_dev << "! CONNECTION ESTABLISHED\n"
           socket.extend(DebugSocket)
           socket.debug_dev = @debug_dev
         end
       rescue SystemCallError => e
-        e.message << " (#{host}:#{port})"
-        raise
+        raise e.class, e.message + " (#{host}:#{port})"
       rescue SocketError => e
-        e.message << " (#{host}:#{port})"
-        raise
+        raise e.class, e.message + " (#{host}:#{port})"
       end
       socket
     end
@@ -871,6 +884,9 @@ class HTTPClient
           rescue EOFError
             close
             buf = nil
+            if @strict_response_size_check
+              raise BadResponseError.new("EOF while reading rest #{@content_length} bytes")
+            end
           end
         end
         if buf && buf.bytesize > 0
@@ -887,18 +903,18 @@ class HTTPClient
     def read_body_chunked(&block)
       buf = empty_bin_str
       while true
-        len = @socket.gets(RS)
-        if len.nil? # EOF
-          close
-          return
-        end
-        @chunk_length = len.hex
-        if @chunk_length == 0
-          @content_length = 0
-          @socket.gets(RS)
-          return
-        end
        ::Timeout.timeout(@receive_timeout, ReceiveTimeoutError) do
+          len = @socket.gets(RS)
+          if len.nil? # EOF
+            close
+            return
+          end
+          @chunk_length = len.hex
+          if @chunk_length == 0
+            @content_length = 0
+            @socket.gets(RS)
+            return
+          end
           @socket.read(@chunk_length, buf)
           @socket.read(2)
         end
@@ -920,6 +936,9 @@ class HTTPClient
             @socket.readpartial(@read_block_size, buf)
           rescue EOFError
             buf = nil
+            if @strict_response_size_check
+              raise BadResponseError.new("EOF while reading chunked response")
+            end
           end
         end
         if buf && buf.bytesize > 0
