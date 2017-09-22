@@ -498,6 +498,7 @@ class HTTPClient
       @status = nil
       @reason = nil
       @headers = []
+      @connect_headers = []
 
       @socket = nil
       @readbuf = nil
@@ -563,7 +564,7 @@ class HTTPClient
         close
         raise
       end
-      [@version, @status, @reason, @headers]
+      [@version, @status, @reason, @headers + @connect_headers]
     end
 
     def eof?
@@ -652,6 +653,7 @@ class HTTPClient
       res = HTTP::Message.new_response('')
       parse_header(socket)
       res.http_version, res.status, res.reason = @version, @status, @reason
+      @connect_headers = @headers
       @headers.each do |key, value|
         res.header.set(key.to_s, value)
       end
