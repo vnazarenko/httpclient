@@ -128,8 +128,8 @@ class HTTPClient
       origin = col[0]
       name = col[1]
       value = col[2]
-      value.chomp!
-      if col[3].empty? or col[3] == '0'
+      value.to_s.chomp!
+      if col[3].to_s.empty? or col[3] == '0'
         expires = nil
       else
         expires = Time.at(col[3].to_i)
