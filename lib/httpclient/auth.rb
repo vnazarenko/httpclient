@@ -178,6 +178,7 @@ class HTTPClient
         auth.set(nil, user, passwd)
       end
       reset_challenge
+      @basic_auth.challenge("basic")
     end
 
     # Filter API implementation.  Traps HTTP request and insert

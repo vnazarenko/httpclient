@@ -1,4 +1,4 @@
-require './lib/httpclient/version'
+require File.expand_path('lib/httpclient/version', __dir__)
 
 Gem::Specification.new { |s|
   s.name = 'httpclient'
